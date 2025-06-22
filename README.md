@@ -5,7 +5,7 @@
 This repository contains the official implementation of the paper "CSI2Depth: Spatio-Temporal Depth Images from Wi-Fi CSI Data via Transformer Networks and conditional Generative Adversarial Networks", presented at the Scandinavian Conference on Image Analysis (SCIA 2025).
 
 
-[**[Paper]**](https://scia2025.org/program/) - Accepted in the 23nd Scandinavian Conference on Image Analysis (SCIA 2025).
+[**[Paper]**](https://link.springer.com/chapter/10.1007/978-3-031-95911-0_26) - Accepted in the 23nd Scandinavian Conference on Image Analysis (SCIA 2025).
 
 [**[Models]**](https://drive.google.com/drive/folders/10tyv_Qt4Ablo_TXdNCIDfkxPTOOdG2kb?usp=sharing) - Available checkpoints files for testing.
 
