@@ -16,9 +16,6 @@ import time
 import numpy as np
 import logging
 
-import random
-import copy
-import torchvision.models as models
 
 import torch
 import torch.nn as nn
@@ -32,142 +29,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.mmfi.mmfi_lib.mmfi import make_dataset, make_dataloader
 from src.csi2depth.csi2depth import CSI2Depth_Generator, CSI2Depth_Discriminator
+from src.loss.mmslab_loss import PerceptualLoss
 
 name_output_folder = ""
 torch.cuda.empty_cache()
 device = torch.device("cpu")
-# Initialize CUDA explicitly
-# if torch.cuda.is_available():
-#     device = torch.device("cuda")
-#     torch.cuda.init()
-#     torch.tensor([0.0], device=device)  # Forces context creation
-# else:
-#     device = torch.device("cpu")
-
-loss_fn_simm = SSIM(win_size=7, win_sigma=1.2, data_range=1.0, size_average=True, channel=1)
-
-# Load VGG16 for perceptual loss
-from torchvision.models import vgg16, VGG16_Weights, VGG19_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
-
-vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-features = create_feature_extractor(vgg, {'features.3': 'relu1_2', 'features.8': 'relu2_2'}).to(device)
-features.eval()
 
 alpha = 5
 beta = 5
 gpw = 10
-
-
-###############################
-#
-#      DA FUNCTIONS
-#
-###############################
-
-def add_gaussian_noise(csi_data, magnitude_std=0.01, phase_std=0.01):
-    # Separate magnitude and phase
-    magnitude = csi_data[:, :, 0, :]  # Shape: [A, S, T]
-    phase = csi_data[:, :, 1, :]  # Shape: [A, S, T]
-
-    # Add noise
-    magnitude_noise = magnitude + torch.randn_like(magnitude) * magnitude_std
-    phase_noise = phase + torch.randn_like(phase) * phase_std
-
-    # Combine back
-    csi_noisy = torch.stack((magnitude_noise, phase_noise), dim=2)  # Correct stacking
-    return csi_noisy  # Shape: [A, S, 2, T]
-
-
-def apply_phase_shift(csi_data, max_shift=np.pi):
-    # Generate random phase shifts
-    phase_shift = torch.rand(1) * 2 * max_shift - max_shift  # Scalar shift
-    csi_data_shifted = csi_data.clone()
-    csi_data_shifted[:, :, 1, :] += phase_shift  # Shift phase component
-    return csi_data_shifted
-
-
-def scale_magnitude(csi_data, scale_range=(0.9, 1.1)):
-    # Generate random scaling factor
-    scale = torch.rand(1) * (scale_range[1] - scale_range[0]) + scale_range[0]
-    csi_data_scaled = csi_data.clone()
-    csi_data_scaled[:, :, 0, :] *= scale  # Scale magnitude component
-    return csi_data_scaled
-
-
-def shift_time(csi_data, max_shift=2):
-    shift = np.random.randint(-max_shift, max_shift + 1)
-    T = csi_data.shape[3]  # Correct index for time dimension
-    shift = shift % T  # Ensure shift is within valid range
-    csi_data_shifted = torch.roll(csi_data, shifts=shift, dims=3)  # Correct dim
-    return csi_data_shifted  # Shape: [A, S, 2, T]
-
-
-def simulate_multipath(csi_data, num_paths=2, delay_max=5, attenuation_range=(0.5, 1.0)):
-    csi_augmented = csi_data.clone()
-    T = csi_data.shape[3]  # Time dimension index
-
-    for _ in range(num_paths):
-        # Generate random delay and attenuation
-        delay = torch.randint(1, min(delay_max + 1, T), (1,)).item()
-        attenuation = torch.rand(1).item() * (attenuation_range[1] - attenuation_range[0]) + attenuation_range[0]
-
-        # Create delayed and attenuated version
-        delayed_csi = csi_data[:, :, :, :-delay]  # Shape: [A, S, 2, T - delay]
-
-        # Pad the time dimension at the beginning to maintain shape
-        pad_size = delay
-        padding = torch.zeros((csi_augmented.shape[0], csi_augmented.shape[1], csi_augmented.shape[2], pad_size), dtype=csi_augmented.dtype, device=csi_augmented.device)
-        delayed_csi_padded = torch.cat((padding, delayed_csi), dim=3)  # Shape: [A, S, 2, T]
-
-        # Apply attenuation
-        delayed_csi_padded *= attenuation
-
-        # Combine with original CSI
-        csi_augmented += delayed_csi_padded
-
-    return csi_augmented  # Shape: [A, S, 2, T]
-
-
-def augment_csi_data(csi_data, number=0):
-    num_augm = random.randint(0, 3)
-    # Apply one augmentation based on the number
-    if num_augm == 0:
-        csi_data = add_gaussian_noise(csi_data)
-    elif num_augm == 1:
-        csi_data = apply_phase_shift(csi_data)
-    elif num_augm == 2:
-        csi_data = scale_magnitude(csi_data)
-    elif num_augm == 3:
-        csi_data = shift_time(csi_data)
-    elif num_augm == 4:
-        csi_data = simulate_multipath(csi_data)
-    return csi_data
-
-
-def create_augmented_dataset(csi_dataset, num_augmentations=3):
-    augmented_data = []
-
-    index = 0
-    amount_data = len(csi_dataset)
-    for sample in csi_dataset:
-        augmented_data.append(sample)  # Add the original sample
-
-        csi_sample = sample['input_wifi-csi']
-        gt_point_cloud = sample['input_depth']
-
-        # Apply augmentations and add to the dataset
-        for idx in range(num_augmentations):
-            csi_augmented = augment_csi_data(csi_sample)
-            sample_cop = copy.deepcopy(sample)
-            sample_cop['input_wifi-csi'] = csi_augmented
-            # 'input_lidar' remains the same
-            augmented_data.append(sample_cop)
-        if index % 100 == 0:
-            print(f"  >> Data augmentation. Sample {index}/{amount_data}")
-        index += 1
-
-    return augmented_data
 
 
 class AugmentedMMFiDataset(torch.utils.data.Dataset):
@@ -215,287 +85,13 @@ def collate_fn_padd2(batch):
     return batch_data
 
 
-###############################
-#
-#      LOSS FUNCTIONS: ARCH
-#
-###############################
-# class PerceptualLoss(nn.Module):
-#     def __init__(self, layers=('3', '8', '15'), weight=1.0):
-#         """
-#         layers: indices of VGG layers at which to extract features.
-#         weight: weight of the perceptual loss.
-#         """
-#         super(PerceptualLoss, self).__init__()
-#         vgg = models.vgg16(pretrained=True).features
-#         self.layers = layers
-#         self.vgg_layers = vgg.eval()
-#         self.weight = weight
-#         for param in self.vgg_layers.parameters():
-#             param.requires_grad = False
-#
-#     def forward(self, generated, target):
-#         # If images are single channel, replicate to 3 channels
-#         if generated.size(1) == 1:
-#             generated = generated.repeat(1, 3, 1, 1)
-#             target = target.repeat(1, 3, 1, 1)
-#
-#         loss = 0.0
-#         x_gen = generated
-#         x_tar = target
-#         for i, layer in self.vgg_layers._modules.items():
-#             x_gen = layer(x_gen)
-#             x_tar = layer(x_tar)
-#             if i in self.layers:
-#                 loss += F.l1_loss(x_gen, x_tar)
-#         return self.weight * loss
-
-class PerceptualLoss(nn.Module):
-    def __init__(self, resize=True, layers=None, weights=VGG19_Weights.IMAGENET1K_V1, loss_fn=nn.L1Loss()):  # Add layers and weights
-        super(PerceptualLoss, self).__init__()
-
-        if layers is None:  # Default layers if not specified
-            layers = [2, 7, 12, 21, 30]  # relu1_2, relu2_2, relu3_2, relu4_2, relu5_2
-
-        vgg = models.vgg19(weights=weights)  # Use weights argument
-        features = list(vgg.features)
-
-        self.vgg_layers = nn.ModuleList(features).eval()
-        self.vgg_layers.requires_grad = False
-        self.layers = layers
-        self.criterion = loss_fn  # nn.L1Loss() or nn.MSELoss()
-        self.resize = resize
-
-    def forward(self, generated_image, real_image):
-        if self.resize:
-            generated_image = nn.functional.interpolate(generated_image, size=(224, 224), mode='bilinear', align_corners=False)
-            real_image = nn.functional.interpolate(real_image, size=(224, 224), mode='bilinear', align_corners=False)
-
-        generated_image = generated_image.repeat(1, 3, 1, 1)  # Repeat channel
-        real_image = real_image.repeat(1, 3, 1, 1)  # Repeat channel
-
-        generated_features = []
-        real_features = []
-
-        for i, layer in enumerate(self.vgg_layers):
-            generated_image = layer(generated_image)
-            real_image = layer(real_image)
-            if i + 1 in self.layers:  # Check if it's the layer we want
-                generated_features.append(generated_image)
-                real_features.append(real_image)
-
-        loss = 0
-        for gen_feat, real_feat in zip(generated_features, real_features):
-            loss += self.criterion(gen_feat, real_feat)
-
-        return loss
-
-
-# # Compute perceptual loss
-# def perceptual_loss(gen_images, gt_images):
-#     """
-#     Compute perceptual loss between generated and ground truth images.
-#
-#     Args:
-#         gen_images (Tensor): Generated images [B, 1, H, W].
-#         gt_images (Tensor): Ground truth images [B, 1, H, W].
-#
-#     Returns:
-#         Tensor: Perceptual loss value.
-#     """
-#     # Repeat the single-channel depth images across 3 channels
-#     gen_images_3ch = gen_images.repeat(1, 3, 1, 1)  # [B, 1, H, W] -> [B, 3, H, W]
-#     gt_images_3ch = gt_images.repeat(1, 3, 1, 1)  # [B, 1, H, W] -> [B, 3, H, W]
-#
-#     # Extract features
-#     gen_features = features(gen_images_3ch)
-#     gt_features = features(gt_images_3ch)
-#
-#     # Compute perceptual loss
-#     loss = F.mse_loss(gen_features['relu2_2'], gt_features['relu2_2'])
-#     return loss
 
 
 ###############################
 #
-#      MODEL FUNCTIONS: ARCH
+#      VISUALIZATION FUNCTIONS
 #
 ###############################
-
-###############################
-#
-#      MODEL FUNCTIONS
-#
-###############################
-
-
-###############################
-#
-#      MAIN FUNCTIONS
-#
-###############################
-# Training Function
-
-import numpy as np
-
-
-def calculate_depth_metrics2(gt_depth, predicted_depth):
-    """
-    Calculates standard depth estimation metrics.
-
-    Args:
-        gt_depth (numpy.ndarray): Ground truth depth image (height x width).
-        predicted_depth (numpy.ndarray): Predicted depth image (height x width).
-
-    Returns:
-        dict: A dictionary containing the calculated metrics:
-              - 'MAE': Mean Absolute Error
-              - 'RMSE': Root Mean Squared Error
-              - 'REL': Relative Absolute Error
-              - 'delta_1.25': Threshold Accuracy with t=1.25
-              - 'delta_1.25^2': Threshold Accuracy with t=1.25^2
-              - 'delta_1.25^3': Threshold Accuracy with t=1.25^3
-    """
-
-    # Ensure valid depth values
-    mask = (gt_depth > 0) & (predicted_depth > 0)  # Avoid invalid depth values (zero or negative)
-
-    if np.sum(mask) == 0:
-        raise ValueError("No valid depth values found for evaluation.")
-
-    gt_depth = gt_depth[mask]
-    predicted_depth = predicted_depth[mask]
-
-    # Mean Absolute Error (MAE)
-    mae = np.mean(np.abs(predicted_depth - gt_depth))
-
-    # Root Mean Squared Error (RMSE)
-    rmse = np.sqrt(np.mean((predicted_depth - gt_depth) ** 2))
-
-    # Relative Absolute Error (REL)
-    rel = np.mean(np.abs(predicted_depth - gt_depth) / gt_depth)
-
-    # Threshold Accuracy (delta)
-    threshold = np.maximum(gt_depth / predicted_depth, predicted_depth / gt_depth)
-
-    delta_1_25 = np.mean(threshold < 1.25)
-    delta_1_25_2 = np.mean(threshold < (1.25 ** 2))
-    delta_1_25_3 = np.mean(threshold < (1.25 ** 3))
-
-    return {
-        "MAE": mae,
-        "RMSE": rmse,
-        "REL": rel,
-        "delta_1": delta_1_25,
-        "delta_2": delta_1_25_2,
-        "delta_3": delta_1_25_3
-    }
-
-
-def calculate_depth_metrics(gt_depth, predicted_depth):
-    """
-    Calculates standard depth estimation metrics.
-
-    Args:
-        gt_depth (numpy.ndarray): Ground truth depth image (height x width x 1 or height x width).
-        predicted_depth (numpy.ndarray): Predicted depth image (height x width x 1 or height x width).
-
-    Returns:
-        dict: A dictionary containing the calculated metrics:
-              - 'MAE': Mean Absolute Error
-              - 'RMSE': Root Mean Squared Error
-              - 'REL': Relative Absolute Error
-              - 'delta_1.25': Threshold Accuracy with t=1.25
-              - 'delta_1.25^2': Threshold Accuracy with t=1.25^2
-              - 'delta_1.25^3': Threshold Accuracy with t=1.25^3
-    """
-
-    # # Ensure depth images are flattened for metric calculation
-    # gt_depth_flat = gt_depth.flatten()
-    # predicted_depth_flat = predicted_depth.flatten()
-    #
-    # # Remove invalid pixels (e.g., where ground truth depth is zero or invalid)
-    # valid_mask = gt_depth_flat > 0 and predicted_depth_flat > 0  # Assuming zero or negative depth is invalid
-    # gt_depth_valid = gt_depth_flat[valid_mask]
-    # predicted_depth_valid = predicted_depth_flat[valid_mask]
-
-    gt_depth_flat = gt_depth.flatten()
-    predicted_depth_flat = predicted_depth.flatten()
-
-
-
-    # Remove invalid pixels (e.g., where ground truth depth is zero or invalid)
-    # AND remove predicted depth values that are zero or negative
-    # valid_mask = (gt_depth_flat > 0) & (predicted_depth_flat > 0) # Added condition for predicted depth
-    valid_mask = gt_depth_flat > 0   # Added condition for predicted depth
-    gt_depth_valid = gt_depth_flat[valid_mask]
-    predicted_depth_valid = predicted_depth_flat[valid_mask]
-    # predicted_depth_valid[predicted_depth_valid == 0] = 1
-
-
-    # # predicted_depth_valid[predicted_depth_valid > 255] = 255
-    # # print(gt_depth_valid)
-    # # print(predicted_depth_valid)
-    # gt_depth_valid = gt_depth_flat
-    # predicted_depth_valid = predicted_depth_flat
-    # # gt_depth_valid[gt_depth_valid == 0] = 0.01
-    # # predicted_depth_valid[predicted_depth_valid == 0] = 0.01
-
-
-    if gt_depth_valid.size == 0:
-        return {
-            'MAE': np.nan,
-            'RMSE': np.nan,
-            'REL': np.nan,
-            'delta_1.25': np.nan,
-            'delta_1.25^2': np.nan,
-            'delta_1.25^3': np.nan
-        }
-
-
-    # Mean Absolute Error (MAE)
-    mae = np.mean(np.abs(gt_depth_valid - predicted_depth_valid))
-
-    # Root Mean Squared Error (RMSE)
-    rmse = np.sqrt(np.mean((gt_depth_valid - predicted_depth_valid)**2))
-
-    # Relative Absolute Error (REL)
-    # rel = np.mean(np.abs(gt_depth_valid - predicted_depth_valid) / (gt_depth_valid + 1e-6)) # Added small epsilon to avoid division by zero
-    rel = np.mean(np.abs(gt_depth_valid - predicted_depth_valid) / (gt_depth_valid + 1e-12)) # Added small epsilon to avoid division by zero
-
-
-    # Threshold Accuracy (delta_t)
-    deltas = {}
-    thresholds = [1.25, 1.25**2, 1.25**3]
-    indx_d = 1
-    for t in thresholds:
-        max_ratio = np.maximum(predicted_depth_valid / (gt_depth_valid + 1e-12), gt_depth_valid / (predicted_depth_valid + 1e-12)) # Added small epsilon
-        delta_t = np.mean(max_ratio < t)
-        deltas[f'delta_{indx_d}'] = delta_t # Formatted key for clarity, e.g., delta_1.250
-        indx_d += 1
-
-    metrics = {
-        'MAE': mae,
-        'RMSE': rmse,
-        'REL': rel,
-        'delta_1': deltas['delta_1'],
-        'delta_2': deltas['delta_2'], # 1.25^2 = 1.5625, using formatted value for key access
-        'delta_3': deltas['delta_3']  # 1.25^3 = 1.953125, using formatted value for key access
-    }
-
-    # if metrics["REL"] > 5:
-    #     print(metrics)
-    #     print(gt_depth_flat)
-    #     print("fdfkjfdkfkfdkfjdkf")
-    #     print(predicted_depth_flat)
-    #     input("sdfkjslfdölsjflösdjfl")
-
-    # input("sdfkjslfdölsjflösdjfl")
-    #
-
-
-    return metrics
-
 
 def figure_to_array(fig, target_size=None, dpi=400):
     """
@@ -519,7 +115,8 @@ def figure_to_array(fig, target_size=None, dpi=400):
 
     return np.array(img)
 
-def visualize_wifi_csi2(wifi_csi_frame, frame_index):
+
+def visualize_wifi_csi(wifi_csi_frame, frame_index):
     """
     Visualize the magnitude and phase of the CSI data for all 3 antennas.
 
@@ -572,66 +169,12 @@ def visualize_wifi_csi2(wifi_csi_frame, frame_index):
     return image_bgr  # Return the image in BGR format (OpenCV compatible)
 
 
-def visualize_wifi_csi_antenna1_spectrograms_smooth(wifi_csi_frame, target_resolution=(640, 480)):
-    """
-    Visualize SMOOTHED magnitude and phase spectrograms for ANTENNA 1 of CSI data.
-
-    Args:
-        wifi_csi_frame (numpy.ndarray): CSI data, shape: [num_antennas, num_subcarriers, 2 (magnitude/phase), num_time_slices]
-        target_resolution (tuple): Desired resolution (width, height) of spectrogram images.
-
-    Returns:
-        tuple: (magnitude_spectrogram_image, phase_spectrogram_image) - OpenCV BGR images, smoothed.
-    """
-    num_antennas, num_subcarriers, _, num_time_slices = wifi_csi_frame.shape
-
-    # Extract magnitude and phase for ANTENNA 1 ONLY
-    csi_magnitude_ant1 = wifi_csi_frame[0, :, 0, :]  # Shape: [num_subcarriers, num_time_slices] (Antenna 1, Magnitude)
-    csi_phase_ant1 = wifi_csi_frame[0, :, 1, :]      # Shape: [num_subcarriers, num_time_slices] (Antenna 1, Phase)
-
-    # Unwrap the phase to avoid discontinuities between subcarriers
-    csi_phase_unwrapped_ant1 = np.unwrap(csi_phase_ant1, axis=0)  # Unwrap along subcarriers (axis=0 because now subcarriers is the first dimension)
-
-    # --- Magnitude Spectrogram (Antenna 1) ---
-    fig_mag, ax_mag = plt.subplots(figsize=(6.4, 4.8)) # Adjust figsize for desired output image size
-    im_mag = ax_mag.imshow(csi_magnitude_ant1, aspect='auto', cmap='viridis', extent=[0, num_time_slices, 0, num_subcarriers], interpolation='none') # interpolation='none' for initial heatmap
-    ax_mag.set_title('Antenna 1 Magnitude Spectrogram', fontsize=10) # Reduced fontsize
-    ax_mag.set_xlabel('Time Slices', fontsize=8) # Reduced fontsize
-    ax_mag.set_ylabel('Subcarriers', fontsize=8) # Reduced fontsize
-    fig_mag.colorbar(im_mag, ax=ax_mag, shrink=0.7) # Reduced colorbar shrink
-    fig_mag.canvas.draw()
-    mag_spectrogram_np = np.frombuffer(fig_mag.canvas.tostring_rgb(), dtype=np.uint8)
-    mag_spectrogram_image_raw = mag_spectrogram_np.reshape(fig_mag.canvas.get_width_height()[::-1] + (3,))
-    mag_spectrogram_image_raw_bgr = cv2.cvtColor(mag_spectrogram_image_raw, cv2.COLOR_RGB2BGR) # To BGR
-    plt.close(fig_mag) # Close figure
-
-    # --- Phase Spectrogram (Antenna 1) ---
-    fig_phase, ax_phase = plt.subplots(figsize=(6.4, 4.8)) # Adjust figsize
-    im_phase = ax_phase.imshow(csi_phase_unwrapped_ant1, aspect='auto', cmap='twilight', extent=[0, num_time_slices, 0, num_subcarriers], interpolation='none') # interpolation='none' for initial heatmap
-    ax_phase.set_title('Antenna 1 Phase Spectrogram (Unwrapped)', fontsize=10) # Reduced fontsize
-    ax_phase.set_xlabel('Time Slices', fontsize=8) # Reduced fontsize
-    ax_phase.set_ylabel('Subcarriers', fontsize=8) # Reduced fontsize
-    fig_phase.colorbar(im_phase, ax=ax_phase, shrink=0.7) # Reduced colorbar shrink
-    fig_phase.canvas.draw()
-    phase_spectrogram_np = np.frombuffer(fig_phase.canvas.tostring_rgb(), dtype=np.uint8)
-    phase_spectrogram_image_raw = phase_spectrogram_np.reshape(fig_phase.canvas.get_width_height()[::-1] + (3,))
-    phase_spectrogram_image_raw_bgr = cv2.cvtColor(phase_spectrogram_image_raw, cv2.COLOR_RGB2BGR) # To BGR
-    plt.close(fig_phase) # Close figure
-
-
-    # --- Interpolate to Smooth ---
-    target_width, target_height = target_resolution
-    mag_spectrogram_image_smooth = cv2.resize(mag_spectrogram_image_raw_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR) # Bilinear interpolation
-    phase_spectrogram_image_smooth = cv2.resize(phase_spectrogram_image_raw_bgr, (target_width, target_height), interpolation=cv2.INTER_LINEAR) # Bilinear interpolation
-
-    return mag_spectrogram_image_smooth, phase_spectrogram_image_smooth
-
-
-
-
-
-
-def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type="Validation"):
+###############################
+#
+#      MAIN FUNCTIONS
+#
+###############################
+def test_epoch(generator, discriminator, input_device, dataloader, loss, dataset_type="Validation"):
     generator.eval()
     discriminator.eval()
     g_loss_values = []
@@ -645,10 +188,11 @@ def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type=
     total_time = 0
 
     # Setup video writer: 15 FPS, composite frame resolution 1280x960 (each subvideo 640x480)
-    output_video_path = "test_epoch_output2.avi"
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps = 15
-    video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (1920, 960))
+    # output_video_path = "test_epoch_output.avi"
+    # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # fps = 15
+    # video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (1920, 960))
+
     # Initialize a global frame counter
     frame_counter = 0
 
@@ -695,7 +239,6 @@ def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type=
 
             # Metric comparison
 
-
             # Save real and generated images every few epochs
             save_images = True
             if save_images:
@@ -729,8 +272,8 @@ def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type=
 
                     # Prepare CSI spectrogram images
                     wifi_csi_np = batch['input_wifi-csi'][frame_idx].cpu().numpy()  # Get the entire CSI frame [antennas, subcarriers, 2, time_slices]
-                    # mag_spectrogram_image, phase_spectrogram_image = visualize_wifi_csi_antenna1_spectrograms_smooth(wifi_csi_np)  # Pass the full CSI frame
-                    mag_spectrogram_image = visualize_wifi_csi2(wifi_csi_np, 0)  # Pass the full CSI frame
+
+                    mag_spectrogram_image = visualize_wifi_csi(wifi_csi_np, 0)  # Pass the full CSI frame
 
                     resized_mag_csi = cv2.resize(mag_spectrogram_image, (1280, 960))
                     # resized_phase_csi = cv2.resize(phase_spectrogram_image, (640, 480))
@@ -741,15 +284,15 @@ def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type=
                     composite_frame = np.hstack((top_row, resized_mag_csi))
 
                     # Write composite frame to video
-                    video_writer.write(composite_frame)
+                    # video_writer.write(composite_frame)
 
                     # Optionally display the composite frame
                     cv2.imshow("Composite", composite_frame)
                     if cv2.waitKey(10) & 0xFF == ord('q'):
                         break
 
-        video_writer.release()
-        cv2.destroyAllWindows()
+        # video_writer.release()
+        # cv2.destroyAllWindows()
         # Average losses
         avg_d_loss = np.mean(d_loss_values)
         avg_g_loss = np.mean(g_loss_values)
@@ -760,218 +303,6 @@ def test_epoch(generator, discriminator, device, dataloader, loss, dataset_type=
         print(f"     >> Average time per estimation: {(total_time / index_total_time) * 1000:.4f}")
 
         return avg_d_loss, avg_g_loss
-
-
-def save_checkpoint_last(model, optimizer, epoch, loss, checkpoint_dir, name_model="default"):
-    """
-    Save a checkpoint of the model state, optimizer state, epoch, and loss, along with model parameters.
-
-    :param model: Model to save.
-    :param optimizer: Optimizer to save.
-    :param epoch: Current epoch.
-    :param loss: Loss value at this epoch.
-    :param checkpoint_dir: Directory to save checkpoints.
-    :param name_model: Name for the checkpoint file.
-    """
-    import os
-    import torch
-
-    # Ensure the checkpoint directory exists
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Define the checkpoint path
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_last_{name_model}.pth")
-
-    # Create the checkpoint dictionary
-    checkpoint = {
-        'epoch': epoch + 1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-
-    # Dynamically add model parameters if the encoder exists
-    if hasattr(model, 'csi_encoder'):
-        csi_encoder = model.csi_encoder
-        checkpoint.update({
-            'embedding_dim': getattr(csi_encoder, 'embedding_dim', None),
-            'num_heads': getattr(csi_encoder, 'num_heads', None),
-            'num_encoder_layers': getattr(csi_encoder, 'num_encoder_layers', None),
-            'num_points': getattr(csi_encoder, 'num_points', None),
-            'num_antennas': getattr(csi_encoder, 'num_antennas', None),
-            'num_subcarriers': getattr(csi_encoder, 'num_subcarriers', None),
-            'num_time_slices': getattr(csi_encoder, 'num_time_slices', None),
-        })
-
-    # Save the checkpoint
-    torch.save(checkpoint, checkpoint_path)
-    print(f"     >> Checkpoint saved at: {checkpoint_path}")
-
-
-def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir, name_model="default"):
-    """
-    Save a checkpoint of the model state, optimizer state, epoch, and loss, along with model parameters.
-
-    :param model: Model to save.
-    :param optimizer: Optimizer to save.
-    :param epoch: Current epoch.
-    :param loss: Loss value at this epoch.
-    :param checkpoint_dir: Directory to save checkpoints.
-    :param name_model: Name for the checkpoint file.
-    """
-    import os
-    import torch
-
-    # Ensure the checkpoint directory exists
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Define the checkpoint path
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch + 1}_{name_model}.pth")
-
-    # Create the checkpoint dictionary
-    checkpoint = {
-        'epoch': epoch + 1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-
-    # Dynamically add model parameters if the encoder exists
-    if hasattr(model, 'csi_encoder'):
-        csi_encoder = model.csi_encoder
-        checkpoint.update({
-            'embedding_dim': getattr(csi_encoder, 'embedding_dim', None),
-            'num_heads': getattr(csi_encoder, 'num_heads', None),
-            'num_encoder_layers': getattr(csi_encoder, 'num_encoder_layers', None),
-            'num_points': getattr(csi_encoder, 'num_points', None),
-            'num_antennas': getattr(csi_encoder, 'num_antennas', None),
-            'num_subcarriers': getattr(csi_encoder, 'num_subcarriers', None),
-            'num_time_slices': getattr(csi_encoder, 'num_time_slices', None),
-        })
-
-    # Save the checkpoint
-    torch.save(checkpoint, checkpoint_path)
-    print(f"     >> Checkpoint saved at: {checkpoint_path}")
-
-
-# def load_checkpoint(model, optimizer, checkpoint_path):
-#     """
-#     Load model and optimizer state from a checkpoint, with parameter checks.
-
-#     Args:
-#         model (nn.Module): The model instance.
-#         optimizer (torch.optim.Optimizer): The optimizer instance.
-#         checkpoint_path (str): Path to the checkpoint file.
-
-#     Returns:
-#         int: The epoch to resume training from.
-#     """
-#     if not os.path.isfile(checkpoint_path):
-#         print(f"     >> No checkpoint found at: {checkpoint_path}")
-#         return 0  # Start from epoch 0 if no checkpoint is available
-
-#     print(f"Loading checkpoint from {checkpoint_path}")
-#     checkpoint = torch.load(checkpoint_path)
-#     model.load_state_dict(checkpoint['model_state_dict'])
-#     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-#     start_epoch = checkpoint['epoch']
-#     print(f"     >> Resumed training from epoch {start_epoch}")
-
-#     # Validate model parameters with assertions if attributes exist
-#     if hasattr(model, 'csi_encoder'):
-#         assert model.csi_encoder.embedding_dim == checkpoint['embedding_dim'], "Mismatch in embedding dimensions!"
-#         assert model.csi_encoder.num_heads == checkpoint['num_heads'], "Mismatch in number of heads!"
-#         assert model.csi_encoder.num_antennas == checkpoint['num_antennas'], "Mismatch in number of antennas!"
-#         assert model.csi_encoder.num_subcarriers == checkpoint['num_subcarriers'], "Mismatch in number of subcarriers!"
-#         assert model.csi_encoder.num_points == checkpoint['num_points'], "Mismatch in number of cloud points!"
-#         assert model.csi_encoder.num_time_slices == checkpoint['num_time_slices'], "Mismatch in number of time slices!"
-
-#     return start_epoch
-
-
-def load_checkpoint(model, optimizer, checkpoint_path):
-    """
-    Load model and optimizer state from a checkpoint, with parameter checks.
-
-    Args:
-        model (nn.Module): The model instance.
-        optimizer (torch.optim.Optimizer): The optimizer instance.
-        checkpoint_path (str): Path to the checkpoint file.
-
-    Returns:
-        int: The epoch to resume training from.
-        float: The loss value from the checkpoint.
-    """
-    if not os.path.isfile(checkpoint_path):
-        print(f"     >> No checkpoint found at: {checkpoint_path}")
-        return 0, float('inf')  # Start from epoch 0, return high loss if checkpoint is missing
-
-    print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    start_epoch = checkpoint.get('epoch', 0)
-    loss = checkpoint.get('loss', float('inf'))  # Default to a high value if 'loss' key is missing
-
-    print(f"     >> Resumed training from epoch {start_epoch}, with checkpoint loss: {loss:.6f}")
-
-    # Validate model parameters with assertions if attributes exist
-    if hasattr(model, 'csi_encoder'):
-        assert model.csi_encoder.embedding_dim == checkpoint['embedding_dim'], "Mismatch in embedding dimensions!"
-        assert model.csi_encoder.num_heads == checkpoint['num_heads'], "Mismatch in number of heads!"
-        assert model.csi_encoder.num_antennas == checkpoint['num_antennas'], "Mismatch in number of antennas!"
-        assert model.csi_encoder.num_subcarriers == checkpoint['num_subcarriers'], "Mismatch in number of subcarriers!"
-        assert model.csi_encoder.num_points == checkpoint['num_points'], "Mismatch in number of cloud points!"
-        assert model.csi_encoder.num_time_slices == checkpoint['num_time_slices'], "Mismatch in number of time slices!"
-
-    return start_epoch, loss
-
-
-def save_final_model(generator, discriminator, model_version, num_epochs, learning_rate, optimizer_name, save_dir="../models/"):
-    """
-    Save the final generator and discriminator models after training.
-
-    Args:
-        generator (nn.Module): Trained generator model.
-        discriminator (nn.Module): Trained discriminator model.
-        model_version (str): Version name for the model.
-        num_epochs (int): Number of epochs the model was trained for.
-        learning_rate (float): Learning rate used in training.
-        optimizer_name (str): Name of the optimizer.
-        save_dir (str): Directory to save the final models.
-    """
-    # Ensure the directory exists
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Get the current date for the filename
-    date_str = time.strftime("%d%m%y")
-
-    # Create metadata to save with the model
-    metadata = {
-        'model_version': model_version,
-        'num_epochs': num_epochs,
-        'learning_rate': learning_rate,
-        'optimizer_name': optimizer_name,
-        'date_saved': date_str,
-    }
-
-    # Save the generator
-    generator_path = os.path.join(
-        save_dir,
-        f"csi2depth_generator_{date_str}_{model_version}_ep{num_epochs}_lr{learning_rate:.0e}_{optimizer_name}.pth"
-    )
-    torch.save({'model_state_dict': generator.state_dict(), 'metadata': metadata}, generator_path)
-    print(f" >> Generator model saved: {generator_path}")
-
-    # Save the discriminator
-    discriminator_path = os.path.join(
-        save_dir,
-        f"csi2depth_discriminator_{date_str}_{model_version}_ep{num_epochs}_lr{learning_rate:.0e}_{optimizer_name}.pth"
-    )
-    torch.save({'model_state_dict': discriminator.state_dict(), 'metadata': metadata}, discriminator_path)
-    print(f" >> Discriminator model saved: {discriminator_path}")
 
 
 def load_checkpoint_for_transfer(model, checkpoint_path):
@@ -1026,42 +357,25 @@ def main():
     print(f"  * Dataset path: {dataset_root}")
     print('\n')
 
-
     with open(yaml_config_file, 'r') as fd:
         config = yaml.load(fd, Loader=yaml.FullLoader)
 
-    train_dataset, val_dataset = make_dataset(dataset_root, config)
+    train_dataset, val_dataset = make_dataset(dataset_root, config, subsampling=1, frame_limit=50)
 
     rng_generator = torch.manual_seed(config['init_rand_seed'])
-    train_loader = make_dataloader(train_dataset, is_training=True, generator=rng_generator, **config['train_loader'])
     val_loader = make_dataloader(val_dataset, is_training=False, generator=rng_generator, **config['validation_loader'])
 
-    # print(val_loader)
-
-    print(f"[TRAINING]")
-    # batch_size = config['train_loader']['batch_size']
-    # print(f"  * Batch size: {batch_size}")
-    print(f"    >> [CSI2DEPTH Train] Trainset samples: {len(train_loader)}. Batch size: {config['train_loader']['batch_size']}")
-    print(f"    >> [CSI2DEPTH Train] Testset samples: {len(val_loader)}")
-    # input("paksdsdfmn")
-
-
-    print(val_loader)
-    # for batch in val_loader:
-    #     print(batch)
-    #     input("para")
+    print(f"[TESTING]")
+    print(f"    >> [CSI2Depth Test] Testset samples: {len(val_loader)}")
+    print(f"    >> [CSI2Depth Test] Selected data split: {config['split_to_use']}")
 
     #############################
     #        MODEL CONFIG       #
     #############################
-    # Initialize device
     torch.cuda.empty_cache()
+
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")
-
-    logging.info("----- Model and Training Information -----")
-    logging.info(f"    >> [CSI2DEPTH Train] Device: {device}")
-    logging.info(f"\n")
 
     # Model Parameters
     embedding_dim = 256
@@ -1093,26 +407,14 @@ def main():
         num_time_slices=num_time_slices
     ).to(device)
 
+    checkpoint_path_generator = "../models/checkpoints/checkpoint_epoch_last_dcsi2depth25_gan_arch004af_generator.pth"  # Paper SCIA
+    checkpoint_path_discriminator = "../models/checkpoints/checkpoint_epoch_last_dcsi2depth25_gan_arch004af_discriminator.pth"  # Paper SCIA
 
-    checkpoint_path_generator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004af_generator.pth" # Paper SCIA
-    checkpoint_path_discriminator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004af_discriminator.pth" # Paper SCIA
-
-    checkpoint_path_generator = "../models/good_ones/checkpoint_epoch_130_dcsi2depth25_gan_arch004ab3_generator.pth"
-    checkpoint_path_discriminator = "../models/good_ones/checkpoint_epoch_130_dcsi2depth25_gan_arch004ab3_discriminator.pth"
-
-    checkpoint_path_generator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ab3d_generator.pth"
-    checkpoint_path_discriminator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ab3d_discriminator.pth"
-
-    checkpoint_path_generator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ad2_generator.pth"
-    checkpoint_path_discriminator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ad2_discriminator.pth"
-
-    # checkpoint_path_generator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ab3_generatorb.pth"
-    # checkpoint_path_discriminator = "../models/good_ones/checkpoint_epoch_last_dcsi2depth25_gan_arch004ab3_discriminatorb.pth"
+    checkpoint_path_generator = "../models/checkpoints/checkpoint_epoch_last_dcsi2depth25_gan_arch004ad2_generator.pth"
+    checkpoint_path_discriminator = "../models/checkpoints/checkpoint_epoch_last_dcsi2depth25_gan_arch004ad2_discriminator.pth"
 
     load_checkpoint_for_transfer(generator, checkpoint_path_generator)
     load_checkpoint_for_transfer(discriminator, checkpoint_path_discriminator)
-
-
 
     global alpha
     global beta
@@ -1121,27 +423,19 @@ def main():
     beta = 15
     gpw = 20
 
-
-
     t0 = time.time()
 
-    logging.info(f"\n############################")
-    logging.info(f"\n#     Training Process     #")
-    logging.info(f"\n############################")
-
-    perceptual_loss_fn = PerceptualLoss(layers=[2, 7, 12, 21, 30], weights=VGG19_Weights.IMAGENET1K_V1).to(device)
-
+    perceptual_loss_fn = PerceptualLoss(layers=[2, 7, 12, 21, 30]).to(device)
 
     # Validation
     val_d_loss, val_g_loss = test_epoch(
         generator=generator,
         discriminator=discriminator,
-        device=device,
+        input_device=device,
         dataloader=val_loader,
         loss=perceptual_loss_fn,
         dataset_type="Validation"
     )
-
 
     print(f"Total training time: {(time.time() - t0) / 60:.2f} minutes")
 
