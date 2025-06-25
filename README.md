@@ -100,10 +100,12 @@ This script loads the pre-trained model, processes example CSI data, and generat
 ##  Citation
 ```
 @inproceedings{alvarez2025csi2depth,
-  title={CSI2Depth: Spatio-Temporal Depth Images from Wi-Fi CSI Data via Transformer Networks and conditional Generative Adversarial Networks},
-  author={Álvarez Casado, Constantino and Lage Cañellas, Manuel and Mustaniemi, Janne and Pedone, Matteo and Silvén, Olli and Bordallo López, Miguel},
-  booktitle={Scandinavian Conference on Image Analysis (SCIA)},
-  year={2025}
+  title={CSI2Depth: Spatio-Temporal Depth Images from Wi-Fi CSI Data via Transformer Networks and Conditional Generative Adversarial Networks},
+  author={{\'A}lvarez Casado, Constantino and Lage Ca{\~n}ellas, Manuel and Mustaniemi, Janne and Pedone, Matteo and Silv{\'e}n, Olli and Bordallo L{\'o}pez, Miguel},
+  booktitle={Scandinavian Conference on Image Analysis},
+  pages={368--382},
+  year={2025},
+  organization={Springer}
 }
 ```
 
